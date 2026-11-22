@@ -294,7 +294,7 @@ class PVShifter {
     this.re = new Float64Array(N); this.im = new Float64Array(N);
     const H = this.half + 1;
     this.lastPh = new Float64Array(H); this.sumPh = new Float64Array(H);
-    this.aMag = new Float64Array(H); this.aFrq = new Float64Array(H);
+    this.aMag = new Float64Array(H); this.aFrq = new Float64Array(H); this.aPh = new Float64Array(H);
     this.sMag = new Float64Array(H); this.sFrq = new Float64Array(H);
     this.rev = new Uint32Array(N);
     const bits = Math.round(Math.log2(N));
@@ -330,9 +330,11 @@ class PVShifter {
       }
     }
   }
+  // The shifter always runs, and its input is also delayed by the same latency ("dry").
+  // At pitch 0 the clean dry signal is heard; changing the pitch crossfades between dry and
+  // shifted over ~20 ms, so there is no hard switch and no jump in timing (no click).
+  // shifted output only, exactly N samples late (the PitchStage below mixes it with the dry sound)
   process(input, output, factor) {
-    if (factor === 1) { output.set(input); this.bypassed = true; return; }
-    if (this.bypassed) { this.reset(); this.bypassed = false; }
     const N = this.N, lat = this.lat;
     for (let i = 0; i < input.length; i++) {
       this.inF[this.rover] = input[i];
@@ -355,7 +357,7 @@ class PVShifter {
       if (q >= 0) q += q & 1; else q -= q & 1;
       d -= Math.PI * q;
       d = osamp * d / TWO_PI;
-      this.aMag[k] = mag; this.aFrq[k] = k + d;
+      this.aMag[k] = mag; this.aFrq[k] = k + d; this.aPh[k] = ph;
     }
     let ea = 0, es = 0;
     if (factor > 1) {
@@ -394,7 +396,8 @@ class PVShifter {
     }
     for (let k = half + 1; k < N; k++) { re[k] = 0; im[k] = 0; }
     this.fft(re, im, true);
-    const scale = 2 / (half * osamp) / 1.35; // 1.35: measured overlap gain of this window/hop
+    // 1.5 = exact overlap gain of this window/hop (used unshifted); 1.35 = measured when shifted
+    const scale = 2 / (half * osamp) / (factor === 1 ? 1.5 : 1.35);
     for (let k = 0; k < N; k++) this.acc[k] += scale * win[k] * re[k];
     for (let k = 0; k < step; k++) this.outF[k] = this.acc[k];
     this.acc.copyWithin(0, step, step + N);
@@ -402,16 +405,64 @@ class PVShifter {
   }
 }
 
+/* Click-free pitch changes for one channel: two shifters run side by side, plus the dry sound
+   delayed to match. A new pitch goes to the shifter that is silent; once it has settled at the
+   new pitch, the sound crossfades over to it (equal power, ~30 ms). No running shifter ever
+   changes its pitch while it is heard. Pitch 0 = the untouched dry sound. */
+class PitchStage {
+  constructor(N) {
+    this.N = N;
+    this.a = new PVShifter(N); this.b = new PVShifter(N);
+    this.fa = 1; this.fb = 1;
+    this.dry = new Float32Array(N); this.di = 0;
+    this.gd = 1; this.ga = 0; this.gb = 0;   // current mix amounts
+    this.td = 1; this.ta = 0; this.tb = 0;   // target mix amounts
+    this.target = 1; this.wait = 0; this.incoming = null;
+    this.bufA = new Float32Array(128); this.bufB = new Float32Array(128);
+  }
+  process(input, output, factor) {
+    const n = input.length, N = this.N;
+    if (factor !== this.target) {
+      this.target = factor;
+      if (factor === 1) { this.td = 1; this.ta = 0; this.tb = 0; this.wait = 0; this.incoming = null; }
+      else {
+        // the quieter shifter starts fresh at the new pitch (a running shifter whose pitch changes
+        // loses phase coherence and gets quiet), then fills for a moment before it is heard
+        this.incoming = this.ga <= this.gb ? 'a' : 'b';
+        if (this.incoming === 'a') { this.a.reset(); this.fa = factor; } else { this.b.reset(); this.fb = factor; }
+        this.wait = N + N / 4;
+      }
+    }
+    if (this.bufA.length < n) { this.bufA = new Float32Array(n); this.bufB = new Float32Array(n); }
+    const A = this.bufA.subarray(0, n), B = this.bufB.subarray(0, n);
+    this.a.process(input, A, this.fa);
+    this.b.process(input, B, this.fb);
+    const step = 1 / 1536;
+    for (let i = 0; i < n; i++) {
+      const d = this.dry[this.di];
+      this.dry[this.di] = input[i]; this.di = (this.di + 1) % N;
+      if (this.wait > 0 && --this.wait === 0) {
+        this.td = 0;
+        if (this.incoming === 'a') { this.ta = 1; this.tb = 0; } else { this.tb = 1; this.ta = 0; }
+      }
+      this.gd += Math.max(-step, Math.min(step, this.td - this.gd));
+      this.ga += Math.max(-step, Math.min(step, this.ta - this.ga));
+      this.gb += Math.max(-step, Math.min(step, this.tb - this.gb));
+      output[i] = d * Math.sqrt(this.gd) + A[i] * Math.sqrt(this.ga) + B[i] * Math.sqrt(this.gb);
+    }
+  }
+}
+
 // ~43 ms analysis window regardless of the device's sample rate
 function fftSizeFor(sr) { return sr > 130000 ? 8192 : sr > 65000 ? 4096 : 2048; }
 
 function workletSource() {
-  return PVShifter.toString() + '\n' + fftSizeFor.toString() + `
+  return PVShifter.toString() + '\n' + PitchStage.toString() + '\n' + fftSizeFor.toString() + `
 class PVProc extends AudioWorkletProcessor {
   constructor() {
     super();
     const N = fftSizeFor(sampleRate);
-    this.sh = [new PVShifter(N), new PVShifter(N)];
+    this.sh = [new PitchStage(N), new PitchStage(N)];
     this.f = 1;
     this.port.onmessage = (e) => { if (e.data && typeof e.data.factor === 'number') this.f = e.data.factor; };
   }
@@ -447,6 +498,10 @@ class StretchPlayer extends AudioWorkletProcessor {
     this.playing = false; this.tempo = 1; this.g = 0;
     this.center = 0; this.prevIdx = null; this.direct = true; this.dpos = 0;
     this.blocks = 0; this.seq = 0;
+    // crossfade: when the playback mode switches or the position jumps, the old sound fades out
+    // over ~20 ms while the new one fades in, instead of a hard cut (which clicks)
+    this.xfL = new Float32Array(1024); this.xfR = new Float32Array(1024); this.xfN = 0; this.xfI = 0;
+    this.s2 = [0, 0];
     // scrubbing: the position follows the finger, the sound is time-stretched at the finger's speed
     this.scrub = false; this.spos = 0; this.starget = 0; this.svel = 0; this.velT = 0;
     this.clock = 0; this.stAt = 0; this.sPrev = null; this.sdir = 1;
@@ -456,7 +511,16 @@ class StretchPlayer extends AudioWorkletProcessor {
     if (d.seq) this.seq = d.seq;
     if (d.load) { this.L = new Float32Array(d.load[0]); this.R = d.load[1] ? new Float32Array(d.load[1]) : null; this.len = this.L.length; this.playing = false; this.g = 0; this.reset(0); }
     if (d.unload) { this.L = this.R = null; this.len = 0; this.playing = false; this.g = 0; }
-    if (d.tempo != null && d.tempo !== this.tempo) { const p = this.heard(); this.tempo = d.tempo; this.reset(p); }
+    if (d.tempo != null && d.tempo !== this.tempo) {
+      // just change the speed: the stretch engine continues seamlessly, no restart, no click
+      if (!this.L) this.tempo = d.tempo;
+      else {
+        const p = this.heard();
+        this.tempo = d.tempo;
+        // keep the reported position where it was (the queued sound now counts at the new speed)
+        this.center = p + this.half * this.tempo + (this.qi < this.qn ? (this.Hs - this.qi) * this.tempo : 0);
+      }
+    }
     const clampS = (s) => Math.max(0, Math.min(this.len - 2, s));
     if (d.scrub === true) {
       this.scrub = true; this.playing = false; this.g = 0;
@@ -467,7 +531,10 @@ class StretchPlayer extends AudioWorkletProcessor {
     }
     if (d.scrubTo != null) { this.starget = clampS(d.scrubTo * sampleRate); this.velT = d.vel || 0; this.stAt = this.clock; }
     if (d.scrub === false) { this.scrub = false; }
-    if (d.seek != null) { this.reset(d.seek * sampleRate); if (this.playing) this.g = 0; }
+    if (d.seek != null) {
+      if (this.playing && this.L && this.g > 0) this.captureFade();
+      this.reset(d.seek * sampleRate);
+    }
     if (d.play != null) {
       this.playing = !!d.play && !!this.L;
       if (this.playing && this.heard() >= this.len - 1) this.reset(0);
@@ -568,11 +635,36 @@ class StretchPlayer extends AudioWorkletProcessor {
   }
   reset(p) {
     p = Math.max(0, Math.min(this.len, p));
-    this.direct = this.tempo === 1;
+    // always the stretch path: at exactly 100 % it reproduces the original 1:1, and there is
+    // no switch between two modes when the tempo passes 100 % (that switch caused clicks)
+    this.direct = false;
     this.dpos = p;
     this.center = p + this.half * this.tempo;
     this.prevIdx = null;
     this.accL.fill(0); this.accR.fill(0); this.qn = 0; this.qi = 0;
+    if (!this.direct && this.L) {
+      // pre-roll three frames so the stretched sound starts at full level (no fade-in dip)
+      this.center -= 3 * this.Hs * this.tempo;
+      for (let k = 0; k < 3; k++) this.frame();
+      this.qi = this.qn;
+    }
+  }
+  // one output sample of the current mode (original speed or stretched)
+  nextSample(s2) {
+    if (this.direct) {
+      const j = this.dpos | 0;
+      if (j < this.len) { s2[0] = this.L[j]; s2[1] = this.R ? this.R[j] : s2[0]; } else { s2[0] = s2[1] = 0; }
+      this.dpos++;
+    } else {
+      if (this.qi >= this.qn) this.frame();
+      s2[0] = this.qL[this.qi]; s2[1] = this.qR[this.qi]; this.qi++;
+    }
+  }
+  // render the next ~20 ms of the current sound into the fade-out buffer
+  captureFade() {
+    const n = this.xfL.length, s2 = [0, 0];
+    for (let i = 0; i < n; i++) { this.nextSample(s2); this.xfL[i] = s2[0] * this.g; this.xfR[i] = s2[1] * this.g; }
+    this.xfN = n; this.xfI = 0;
   }
   heard() {
     if (this.direct) return this.dpos;
@@ -657,16 +749,15 @@ class StretchPlayer extends AudioWorkletProcessor {
       oL.fill(0); if (oR) oR.fill(0);
       this.tick(); return true;
     }
-    const step = 1 / 240;
+    const step = 1 / 240, s2 = this.s2;
     for (let i = 0; i < n; i++) {
-      let l, r;
-      if (this.direct) {
-        const j = this.dpos | 0;
-        if (j < this.len) { l = this.L[j]; r = this.R ? this.R[j] : l; } else { l = r = 0; }
-        this.dpos++;
-      } else {
-        if (this.qi >= this.qn) this.frame();
-        l = this.qL[this.qi]; r = this.qR[this.qi]; this.qi++;
+      this.nextSample(s2);
+      let l = s2[0], r = s2[1];
+      if (this.xfI < this.xfN) {
+        const a = this.xfI / this.xfN;
+        l = l * a + this.xfL[this.xfI] * (1 - a);
+        r = r * a + this.xfR[this.xfI] * (1 - a);
+        this.xfI++;
       }
       if (this.g < target) this.g = Math.min(target, this.g + step); else if (this.g > target) this.g = Math.max(target, this.g - step);
       oL[i] = l * this.g; if (oR) oR[i] = r * this.g;
@@ -730,7 +821,7 @@ function ensureAudio() {
       console.warn('AudioWorklet nicht verfügbar, nutze ScriptProcessor', err);
       pitchNode = actx.createScriptProcessor(2048, 2, 2);
       const N = fftSizeFor(actx.sampleRate);
-      const sh = [new PVShifter(N), new PVShifter(N)];
+      const sh = [new PitchStage(N), new PitchStage(N)];
       pitchNode.onaudioprocess = (ev) => {
         const ib = ev.inputBuffer, ob = ev.outputBuffer;
         for (let c = 0; c < 2; c++) {
